@@ -1,0 +1,384 @@
+---
+title: "Final Draft"
+author: "Kevin Montain"
+date: "4/10/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(spData)
+library(sp)
+library(raster)
+library(dplyr)
+library(data.table)
+library(Hmisc)
+library(aspace)
+library(readr)
+library(spatstat)
+library(tidyr)
+library(pscl)
+library(tidyverse)
+library(broom)
+library(ggplot2)
+library(car)
+library(ggmap)
+```
+
+Read the Data into R
+
+```{r}
+setwd("/Users/kevin/Desktop/Aresty/")
+dt <- read.csv("trips_data.csv")
+dt <- setDT(dt)
+```
+Get the ports spatial positions
+```{r message=FALSE}
+dt_ports <- dt %>% distinct(port_lat,port_lon,.keep_all = TRUE) %>% drop_na(.)
+box <- make_bbox(dt_ports$port_lon,dt_ports$port_lat)
+map <- get_stamenmap(box,maptype="toner-background",source='stamen',zoom=8,color='color',force=TRUE)
+ggmap(map) + geom_point(aes(x = port_lon, y = port_lat, colour = duration.status), data = dt_ports) + labs(x="longtitude", y='latitude',color="Duration Status",title="Community Port Location")
+```
+Take each community over the years and get there ANN for first half of trips. Then average the ports that have survived the entire sample vs. those that haven't then look at those that survived longer than 15 years vs. those that didn't.
+
+But first set up the cycle & the spatstat window
+```{r}
+### Create he Projection for analysis
+lat = as.vector(c(dt$declat))
+lon = as.vector(c(dt$declon))
+xy = data.frame(lon, lat)
+coordinates(xy) <- c("lon", "lat")
+proj4string(xy) <- CRS("+proj=longlat +datum=NAD83")
+NE <- spTransform(xy, CRS('+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs'))
+NE <- as.data.frame(NE)
+dt <- cbind(dt,NE)
+###Declare the window extent
+W <- owin( c(min(dt$lon),max(dt$lon)), c(min(dt$lat), max(dt$lat)) )
+comms <- as.vector(unique(dt$community))
+## fish_ppp <- ppp(dt$declon,dt$declat,window = W)
+```
+
+Get the Survival Status per port
+```{r}
+comm_survstat <- dt %>% select(community, duration.status) %>% unique(.)
+```
+
+1) Cycle through the communities by community And by year +
+2) Put the datatable into spatstat +
+3) Calculate the Ann for first 100 neighbors. +
+4) Put the neighbors into a precreated vector created with each iteration that is bound to a matrix with the previous neighbor count. +
+5) Then calculate the average ANN per port and year.+
+6) Put the result into a vector that will be added to the comm_survstat datatable.+
+```{r message=FALSE, warning=FALSE}
+### Initialize community level values
+ann_result <- vector(length=length(comms))
+comm <- vector(length = length(comms))
+ind2 = 1
+
+not_any_na <- function(x) all(!is.na(x)) ## Funct to clean NA values from future table
+## Begin Community iterations
+for (c in 1:length(comms)){
+  
+  ### Resetting values for each community **********
+  ind1 = 1
+  comm_years <- dt %>% select(community, year, lon, lat) %>% filter(community == comms[c])
+  yrs <- length(unique(comm_years$year))
+  splitPoint <- vector(length = yrs)
+  ann_table <- as.data.table(matrix(seq(1:2500)))
+  ### ************
+  for (yr in 1:yrs){
+    scratch <- comm_years %>% filter(year == sort(unique(comm_years$year))[yr])
+    fish_ppp <- ppp(scratch$lon,scratch$lat,window = W,checkdup = FALSE)
+    len = nrow(scratch)
+    pt_dist <- floor(len/2)
+    if (pt_dist < 2){next}
+    else{
+    ANN <- apply(nndist(fish_ppp, k=1:pt_dist),2,FUN=mean)
+    ann_table <- cbind(ann_table,ANN)
+    splitPoint[ind1] <- len
+    ind1 = ind1 + 1} }
+  
+  ann_table <- ann_table[1:min(splitPoint)] 
+  colnames(ann_table) <- paste(1:ncol(ann_table))
+  Filter(function(x)!all(is.na(x)), ann_table)
+  ### iterate over the columns adding the vectors together into scr_col
+  scr_col <- vector(length = nrow(ann_table))
+  for (i in 2:ncol(ann_table)){
+    scr_col <- scr_col + ann_table %>% pull(i)}
+  ### Get the average across years and neighbors and provide to varaible
+  value <- (scr_col[2]/ncol(ann_table-1))
+  comm[[ind2]] <- comms[ind2]
+  ann_result[[ind2]] <- value
+  ind2 = ind2 + 1}
+
+####
+final_dt <- data.table(comm,ann_result)
+colnames(final_dt) <- c("community","ANN")
+comm_survstat = merge(x = comm_survstat, y = final_dt, by = "community", all.x = TRUE)
+```
+
+Take two groups, groups that lasted a long time >= 15 years and groups that lasted <= 5 years. Compare their means and variance. The following code will prepare the data and determine if it is normal or not. Normality will impact the variance calculation.
+```{r}
+yrs_active <- vector(length = length(comms))
+for (i in 1:length(comms)){
+  scratch <- dt %>% filter(community == comms[i])
+  yrs_active[i] <- length(unique(scratch$year))}
+joinT <- as.data.table(cbind(comms, yrs_active))
+colnames(joinT) <- c('community','yrs_active')
+comm_years_stat = merge(x = comm_survstat, y = joinT, by = "community", all.x = TRUE)
+t_table1 <- comm_years_stat[complete.cases(comm_years_stat),]
+t_table1$yrs_active <- as.integer(t_table1$yrs_active)
+full_sample <- t_table1 %>% filter(yrs_active >= 15)
+no_full_sample <- t_table1 %>% filter(yrs_active <= 5)
+d_set <- t_table1 %>% filter(yrs_active <= 5 | yrs_active>=15) %>% mutate(yrs_act_stat = ifelse(yrs_active <= 5,"years active <= 5","years active >= 15"))
+## Is the data normal?
+shapiro.test(d_set %>% filter(yrs_active <= 5) %>% pull(ANN))
+```
+
+The data is not normal. An F-test will not work. A T-test will work. A plot of the distribuition is:
+```{r}
+ggplot(d_set,aes(ANN, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1)
+```
+
+Based on the Density Functions it may be best to use a Fligner-Killeen Test of Homogeneity of variances.
+```{r message=FALSE, warning=FALSE}
+t.test(x = no_full_sample$ANN, y = full_sample$ANN)
+fligner.test(ANN ~ yrs_act_stat,data=d_set)
+leveneTest(ANN ~ yrs_act_stat,data=d_set,center=median,trim=.01)
+```
+
+I will create a box and whisker plot to show the composition of the data.
+```{r}
+yrs_plot <- t_table1
+yrs_plot <- yrs_plot %>% filter(yrs_active >= 15 || yrs_active <= 5)
+yrs_title <- vector(length = nrow(yrs_plot))
+for (i in 1:nrow(yrs_plot)){
+  if (yrs_plot$yrs_active[i] >= 15){
+    yrs_title[i] <- '>= 15 years'} else {yrs_title[i] <- '<= 5 years'}}
+yrs_plot <- cbind(yrs_plot,yrs_title)
+ggplot(data=yrs_plot, mapping=aes(x=yrs_title, y=ANN)) + geom_boxplot() + labs(x = "Number of Years Active", title = "Difference in Average Nearest Neighbor Over Years", subtitle="T-test p-value: 0.2348; Fligner-Killeen Test p-value: 0.07837")
+```
+
+To get an analysis of community movement I will get the centroid of every year and the centroid of the first and second half of the sample. I will get the distance of the centroids. If the centroids are greater than 50 km and the differnces in lat/long means is greater than 1, meaning the second half is greater than the first sample, count the occurance.
+Look at the centroids and their distance apart
+```{r message=FALSE, warning=FALSE}
+scratch1 <- left_join(x = dt, y = joinT, by = "community", all.x = TRUE)
+scratch1$yrs_active <- as.double(scratch1$yrs_active)
+scratch2 <- scratch1 %>% filter(yrs_active >= 12)
+ct <- 0
+for (co in 1:length(unique(scratch2$community))){
+  scratch3 <- scratch2 %>% filter(community == unique(scratch2$community)[co])
+  vals_above <- scratch3 %>% filter(year >= floor(mean(unique(year))) ) %>% distinct(year) %>% nrow()
+  vals_below <- scratch3 %>% filter(year < floor(mean(unique(year))) ) %>% distinct(year) %>% nrow()
+  below_thresh_x <- as.double(vector(length = vals_below))
+  below_thresh_y <- as.double(vector(length = vals_below))
+  above_thresh_x <- as.double(vector(length = vals_above))
+  above_thresh_y <- as.double(vector(length = vals_above))
+  ab <- 1
+  be <- 1
+  for (i in 1:length(unique(scratch3$year))){
+    scratch4 <- scratch3 %>% filter(year == unique(scratch3$year)[i])
+    W <- owin( c(min(scratch4$lon), max(scratch4$lon)), c(min(scratch4$lat), max(scratch4$lat) ))
+    fish_ppp <- ppp(scratch4$lon,scratch4$lat, window = W, checkdup = FALSE)
+    if (scratch4$year[1] < floor(mean(unique(scratch3$year)))) {
+      below_thresh_x[[be]] <- as.double(centroid.owin(W, as.ppp = FALSE)[1])
+      below_thresh_y[[be]] <- as.double(centroid.owin(W, as.ppp = FALSE)[2])
+      be = be + 1}
+    else{
+      above_thresh_x[[ab]] <- as.double(centroid.owin(W, as.ppp = FALSE)[1])
+      above_thresh_y[[ab]] <- as.double(centroid.owin(W, as.ppp = FALSE)[2]) 
+      ab = ab + 1} } 
+    above_W <- owin( c(min(above_thresh_x), max(above_thresh_x)), c(min(above_thresh_y), max(above_thresh_y) ))
+    above_centroid_ppp <- ppp(above_thresh_x,above_thresh_y, window = above_W, checkdup = FALSE)
+    above_centroid <- centroid.owin(above_W, as.ppp = TRUE)
+    cord_above <- as.double(centroid.owin(above_W, as.ppp = FALSE))
+    below_W <- owin( c(min(below_thresh_x), max(below_thresh_x)), c(min(below_thresh_y), max(below_thresh_y) ))
+    below_centroid_ppp <- ppp(below_thresh_x,below_thresh_y, window = below_W, checkdup = FALSE)
+    below_centroid <- centroid.owin(below_W, as.ppp = TRUE)
+    cord_below <- as.double(centroid.owin(below_W, as.ppp = FALSE))
+    aboveBelow_dist <- crossdist(below_centroid, above_centroid)[1]/1000
+    if ( ((cord_below[1] < cord_above[1])|(cord_below[2] < cord_above[2])) & (cord_above[2] > cord_below[2]) & (cord_above[1] > cord_below[1]) & (aboveBelow_dist > 50)) {
+      ### x's are bigger
+      if ((cord_below[1] < cord_above[1])){
+        p <- as.double(t.test(above_thresh_x, below_thresh_x, alternative = 'g')[3])
+        if (p < .05){ct <- ct + 1} }
+      
+      
+      ### y's are bigger
+      if ((cord_below[2] < cord_above[2])){
+        p <- as.double(t.test(above_thresh_y, below_thresh_y, alternative = 'g')[3])
+        if (p < .05){ct <- ct + 1} }
+      ### Both are bigger
+      if ((cord_below[1] < cord_above[1])){
+        p1 <- as.double(t.test(above_thresh_x, below_thresh_x, alternative = 'g')[3])
+        p2 <- as.double(t.test(above_thresh_x, below_thresh_x, alternative = 'g')[3])
+        if (p1 < .05 | p2 < .05){ct <- ct + 1} } } } 
+```
+
+I will produce a plot showing the count of significant movement
+```{r}
+a <- round(ct/length(unique(scratch2$community))*100,0)
+b <- round(100 - a,0)
+vals <- c(a,b)
+cats <- c('Showing Trend','Not Showing Trend')
+ma <- as.data.table(cbind(cats,vals))
+ggplot(ma, aes(cats,vals)) + geom_col() + labs(title="Percentage of Communities Showing Movement East or North",subtitle = 'Communities Lasting at Least 12 Years', x ='Categories',  y ='Percentage',caption='Communities showing trend are significant at the 5% level.' )
+```
+
+Now I am going to go back to the main dt brought into this r session.
+1) Get the community boat count by year
+2) Create a new dt that aggregates data by community and year
+3) merge the two data tables
+4) Then create a logit model.
+```{r}
+### 1)
+yr <- vector()
+cm <- vector()
+bts <- vector()
+counter <- 1
+for (i in 1:length(unique(dt$community))){
+  tb <- dt %>% filter(community == unique(dt$community)[i])
+  for (j in 1:length(unique(tb$year))){
+    scratch <- tb %>% filter(year == unique(tb$year)[j])
+    bts[[counter]] <- scratch %>% nrow()
+    yr[[counter]] <- unique(tb$year)[j]
+    cm[[counter]] <- as.character(unique(dt$community)[i]) 
+    counter = counter + 1} }
+tbs <- data.table(cbind(cm,as.character(yr),as.character(bts)))
+colnames(tbs) <- c('community','year','ct')
+tbs$year <- as.integer(tbs$year)
+tbs$count <- as.integer(tbs$count)
+### 2)
+n <- dt
+n$community <- as.character(n$community)
+joinT$yrs_active <- as.integer(joinT$yrs_active)
+new_dt <- left_join(x = n, y = joinT, by = "community", all.x = TRUE)
+new_dt <- new_dt %>% select(community,qtykept,adj_fisher_days,dist_from_port,richness,yrs_active,year, yearfol_survival) %>% group_by(community,year) %>% summarise_all(.funs = mean)
+### 3) 
+table <- left_join(x = as.data.table(new_dt), y = tbs, by = c("community",'year'), all.x = TRUE)
+```
+
+Now create the equation using variables, step 4
+```{r}
+table$ct <- as.integer(table$ct)
+table$yearfol_survival <- as.integer(table$yearfol_survival)
+### Start with a Binomial
+mdl <- glm(yearfol_survival ~ richness + log(ct, base = exp(2)) + qtykept + adj_fisher_days + dist_from_port,family = binomial("logit"), data=table)
+print(pR2(mdl))
+summary(mdl)
+```
+
+Based on McFadden this is an excellent model of survivability. Good models fit in the range of .2-.4 
+
+Now take the data and aggregate the data to the community level.
+```{r message=FALSE, warning=FALSE}
+n <- dt
+n$community <- as.character(n$community)
+joinT$yrs_active <- as.integer(joinT$yrs_active)
+new_dt <- left_join(x = n, y = joinT, by = "community", all.x = TRUE)
+table2 <- left_join(x = as.data.table(new_dt), y = tbs, by = c("community",'year'), all.x = TRUE)
+table2$ct <- as.integer(table2$ct)
+ttTable <- table2 %>% select(community,qtykept,ct,adj_fisher_days,dist_from_port,richness,yrs_active,year) %>% group_by(community) %>% summarize_all(mean)
+mergeTable <- dt %>% select(duration.status,community) %>% unique(.)
+ttTable <- left_join(x = ttTable, y = mergeTable, by = "community", all.x = TRUE)
+```
+
+Now take the ttest of each column
+```{r}
+sig_t <- vector()
+ct_t <- 1
+for (i in 2:ncol(ttTable)){
+  if (i>=7){next}
+  else{
+    groups <- ttTable %>% filter(yrs_active <= 5 | yrs_active >= 15) %>% mutate(yrs_act_stat = ifelse(yrs_active <= 5,"years active <= 5","years active >= 15"))
+    top_group <- groups %>% filter(yrs_active >= 15) %>% pull(i)
+    bottom_group <- groups %>% filter(yrs_active <= 5) %>% pull(i)
+    t_p <- as.double(t.test(top_group, bottom_group, alternative='g')[3])
+    if (t_p < .05){sig_t[[ct_t]] <- colnames(groups)[i]
+    ct_t = ct_t + 1} } }
+print(paste("Characterisitcs where the older ports have larger means",sig_t))
+```
+
+Now Following from above observe the normality of the data. Then plot the data for each column. If the data is very skewed use Fligner-Killeen if not use the levine test. But first get the column names.
+```{r}
+groups <- ttTable %>% filter(yrs_active <= 5 | yrs_active >= 15) %>% mutate(yrs_act_stat = ifelse(yrs_active <= 5,"years active <= 5","years active >= 15"))
+colnames(groups)
+```
+
+Get the shapiro test of quantity kept and create the density plot.
+```{r message=FALSE, warning=FALSE}
+shapiro.test(groups %>% filter(yrs_active >= 15) %>% pull(qtykept))
+ggplot(groups,aes(qtykept, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1)
+```
+
+Hard to determine if the Levene of flinger test should be used so I will use both.
+```{r message=FALSE, warning=FALSE}
+fligner.test(qtykept ~ yrs_act_stat, groups)
+leveneTest(qtykept ~ yrs_act_stat, groups, center = median)
+ggplot(groups,aes(qtykept, fill = yrs_act_stat, colour = yrs_act_stat)) + geom_density(alpha = 0.1) + scale_x_continuous(name='Quantity Kept') + ggtitle("The Distribution of Quantity of Catch Kept,\nDetermined by Years Active", subtitle= paste("Fligner-Killeen Test: ", round(as.double(fligner.test(qtykept ~ yrs_act_stat, groups)[3]),4), "; Brown–Forsythe Test: .1761")) + scale_fill_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))+ scale_color_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))
+```
+The data is not specific based on either test.
+
+Next I will look at the bout count by community 
+```{r}
+shapiro.test(groups %>% filter(yrs_active >= 15) %>% pull(ct))
+ggplot(groups,aes(ct, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1)
+```
+The data is not normally distributed. The data does show some outliers. For safety I will run both tests again.
+```{r}
+fligner.test(ct ~ yrs_act_stat, groups)
+leveneTest(ct ~ yrs_act_stat, groups, center = median)
+ggplot(groups,aes(ct, fill = yrs_act_stat, colour = yrs_act_stat)) + geom_density(alpha = 0.1) + scale_x_continuous(name='Boat Count') + ggtitle("The Distribution of Boat Count,\nDetermined by Years Active", subtitle= paste("Fligner-Killeen Test: ", round(as.double(fligner.test(ct ~ yrs_act_stat, groups)[3]),4), "; Brown–Forsythe Test: .004039")) + scale_fill_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))+ scale_color_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))
+```
+Both tests came back statistically significant regarding the p-values. This indicates the varainces are not equal.
+
+I will now look at the adj_fisher_days
+```{r}
+shapiro.test(groups %>% filter(yrs_active <= 5) %>% pull(adj_fisher_days))
+ggplot(groups,aes(adj_fisher_days, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1)
+```
+
+This is showing a lot of outliers but again I will use both tests. I will weight the Fligner-Killeen test higher.
+```{r message=FALSE, warning=FALSE}
+fligner.test(adj_fisher_days ~ yrs_act_stat, groups)
+leveneTest(adj_fisher_days ~ yrs_act_stat, groups, center = median,trim=.1)
+ggplot(groups,aes(adj_fisher_days, fill = yrs_act_stat, colour = yrs_act_stat)) + geom_density(alpha = 0.1) + scale_x_continuous(name='Boat Count') + ggtitle("The Distribution of Adjusted Fisher Days,\nDetermined by Years Active", subtitle= paste("Fligner-Killeen Test: ", round(as.double(fligner.test(adj_fisher_days ~ yrs_act_stat, groups)[3]),4), "; Brown–Forsythe Test: .004039")) + scale_fill_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))+ scale_color_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))
+```
+The tests show that the varaince is not significantly different.
+
+Now on to the dist_from_port
+```{r message=FALSE, warning=FALSE}
+shapiro.test(groups %>% filter(yrs_active <= 5) %>% pull(dist_from_port))
+ggplot(groups,aes(dist_from_port, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1)
+```
+The data appears to have some issues but doesn't have an extensive amount of problems. Thus I will focus on the Levene test.
+```{r message=FALSE, warning=FALSE}
+fligner.test(dist_from_port ~ yrs_act_stat, groups)
+leveneTest(dist_from_port ~ yrs_act_stat, groups, center = median)
+ggplot(groups,aes(dist_from_port, fill = yrs_act_stat, colour = yrs_act_stat)) + geom_density(alpha = 0.1) + scale_x_continuous(name='Distance From Port') + ggtitle("The Distance From Port Distribuition,\nDetermined by Years Active", subtitle= paste("Fligner-Killeen Test: ", round(as.double(fligner.test(dist_from_port ~ yrs_act_stat, groups)[3]),4), "; Brown–Forsythe Test: .8684")) + scale_fill_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))+ scale_color_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))
+```
+Based on the tests, the varaince is not signifcantly different.
+
+Now to look at richness
+```{r message=FALSE, warning=FALSE}
+shapiro.test(groups %>% filter(yrs_active <= 5) %>% pull(richness))
+shapiro.test(groups %>% filter(yrs_active >= 15) %>% pull(richness))
+ggplot(groups,aes(richness, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1)
+```
+This data is actually showing normality so it is possible to use an F-test.
+```{r message=FALSE, warning=FALSE}
+ggplot(groups,aes(richness, fill = yrs_act_stat,colour = yrs_act_stat)) + geom_density(alpha = 0.1) + scale_x_continuous(name='Richness Index') + ggtitle("The Density of Richness Determined by Years Active", subtitle= paste("F-Test: ", round(as.double(var.test(richness ~ yrs_act_stat, groups)[3]),4))) + scale_fill_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))+ scale_color_discrete(name='Years Active', labels=(c('>= 5 years','<= 5 years')))
+```
+The data is significant at the 5% level. the varainces are not from the same distributions.
+
+
+I will now compare the means using a T-test
+```{r message=FALSE, warning=FALSE}
+ggplot(groups, aes(x=yrs_act_stat,y = ct)) + geom_boxplot() + labs(title="T-Test, Count of Boats By Year Differentiation",x = 'Year Differentiation' , y="Boat Count",subtitle=paste("p-value is: ",round(as.double(t.test(ct~yrs_act_stat,data=groups,alternative='l')[3]),6)))
+```
+
+```{r message=FALSE, warning=FALSE}
+
+ggplot(groups, aes(x=yrs_act_stat,y = richness)) + geom_boxplot() + labs(title="T-Test, Richness By Year Differentiation",x = 'Year Differentiation' , y="Richness",subtitle=paste("p-value is: ",round(as.double(t.test(richness~yrs_act_stat,data=groups,alternative='l')[3]),6)))
+```
